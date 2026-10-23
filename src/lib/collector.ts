@@ -110,10 +110,12 @@ export async function collectAll() {
   // Expire stale items: end date passed, or not seen for 3 days
   const nowIso = new Date().toISOString();
   const staleIso = new Date(Date.now() - 3 * 86400000).toISOString();
+  const oldStartIso = new Date(Date.now() - 2 * 86400000).toISOString();
   await supabase.from("incidents")
     .update({ status: "expired" })
     .eq("status", "active")
-    .or(`ends_at.lt.${nowIso},last_seen_at.lt.${staleIso}`);
+    // end date passed, OR not seen for 3 days, OR no end date but the start date is over 2 days old
+    .or(`ends_at.lt.${nowIso},last_seen_at.lt.${staleIso},and(ends_at.is.null,starts_at.lt.${oldStartIso})`);
 
   return { completedAt: new Date().toISOString(), results };
 }
