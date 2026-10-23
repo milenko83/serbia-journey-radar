@@ -19,12 +19,40 @@ const labels: Record<string, string> = {
 const severityLabel: Record<string, string> = {
   critical: "Critical", high: "High priority", monitor: "Monitor", information: "Information",
 };
+const runStatusLabel: Record<string, string> = {
+  success: "success",
+  empty: "empty (source returned 0 items)",
+  failed: "failed",
+  started: "in progress",
+};
 
+// Items with this score or higher count as "Priority review"
+const PRIORITY_THRESHOLD = 3;
+
+// Date AND time, in Belgrade time (used for collection timestamps)
 function dateLabel(value: string | null) {
   if (!value) return "Time not specified";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "Time not specified" : date.toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short", timeZone: "Europe/Belgrade" });
 }
+
+// Date only. Announcement dates are stored as midnight UTC, so they are formatted in UTC
+// to avoid shifting them to "02:00" Belgrade time.
+function dayLabel(value: string | null) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toLocaleDateString("en-GB", { dateStyle: "medium", timeZone: "UTC" });
+}
+
+function periodLabel(start: string | null, end: string | null, published: string | null) {
+  const from = dayLabel(start) ?? dayLabel(published);
+  const to = dayLabel(end);
+  if (from && to && from !== to) return `${from} – ${to}`;
+  if (from && to) return `${from} (ends the same day)`;
+  if (from) return `${from} · end date not stated`;
+  return "Time not specified";
+}
+
 function timeAgo(value: string | null) {
   if (!value) return "Not reported";
   const date = new Date(value);
@@ -44,15 +72,18 @@ export default function Dashboard({ incidents, dbError, lastRun }: {
 
   const filtered = useMemo(() => incidents.filter(item => {
     const matchesCategory = category === "all" || item.category === category;
-    const search = `${item.title} ${item.summary} ${item.region || ""} ${item.location_text || ""} ${item.source_name}`.toLowerCase();
+    const search = `${item.title} ${item.summary} ${item.region || ""} ${item.location_text || ""} ${item.road || ""} ${item.source_name}`.toLowerCase();
     const matchesQuery = search.includes(query.toLowerCase());
     const matchesReview = review === "all" || item.review_status === review;
     return matchesCategory && matchesQuery && matchesReview;
   }), [incidents, category, query, review]);
 
+  const isPriority = (i: Incident) =>
+    i.severity === "critical" || i.severity === "high" || (i.priority_score ?? 0) >= PRIORITY_THRESHOLD;
+
   const counts = {
     total: incidents.length,
-    urgent: incidents.filter(i => i.severity === "critical" || i.severity === "high").length,
+    urgent: incidents.filter(isPriority).length,
     review: incidents.filter(i => i.review_status === "needs_review").length,
     sources: new Set(incidents.map(i => i.source_name)).size,
   };
@@ -81,7 +112,7 @@ export default function Dashboard({ incidents, dbError, lastRun }: {
     {dbError && <div className="error">{dbError}</div>}
 
     <section className="stats">
-      <div className="stat"><div className="stat-label">Collected records</div><div className="stat-value">{counts.total}</div><div className="stat-note">Stored candidate items</div></div>
+      <div className="stat"><div className="stat-label">Collected records</div><div className="stat-value">{counts.total}</div><div className="stat-note">Active candidate items</div></div>
       <div className="stat"><div className="stat-label">Priority review</div><div className="stat-value">{counts.urgent}</div><div className="stat-note">Rule-based priority, not confirmed impact</div></div>
       <div className="stat"><div className="stat-label">Needs verification</div><div className="stat-value">{counts.review}</div><div className="stat-note">Manual review recommended</div></div>
       <div className="stat"><div className="stat-label">Sources represented</div><div className="stat-value">{counts.sources}</div><div className="stat-note">Sources with stored records</div></div>
@@ -99,15 +130,16 @@ export default function Dashboard({ incidents, dbError, lastRun }: {
             <option value="needs_review">Needs review</option>
             <option value="verified">Verified</option>
           </select>
-          <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search title, place, source…" aria-label="Search incidents"/>
+          <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search title, place, road, source…" aria-label="Search incidents"/>
         </div>
 
         <div className="incidents">
-          {filtered.length === 0 ? <div className="empty"><strong>No records match these filters.</strong>{incidents.length === 0 ? "Run the collector after configuring Supabase and source access. This dashboard will not fabricate incidents." : "Try another category or search term."}</div> :
+          {filtered.length === 0 ? <div className="empty"><strong>No records match these filters.</strong>{incidents.length === 0 ? "No active disruptions are stored right now. This dashboard will not fabricate incidents." : "Try another category or search term."}</div> :
             filtered.map(item => <article className="incident" key={item.id}>
               <div className="incident-top">
                 <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
                   <span className={`tag ${item.severity}`}>{severityLabel[item.severity] || item.severity}</span>
+                  {(item.priority_score ?? 0) >= PRIORITY_THRESHOLD && <span className="tag high">Priority {item.priority_score}</span>}
                   <span className={`tag ${item.category}`}>{labels[item.category] || item.category}</span>
                   <span className="tag information">{item.review_status === "verified" ? "Verified" : "Needs review"}</span>
                 </div>
@@ -117,9 +149,11 @@ export default function Dashboard({ incidents, dbError, lastRun }: {
               <p>{item.summary}</p>
               <div className="meta">
                 <span>📍 {item.location_text || item.region || "Location not extracted"}</span>
-                <span>🕒 {dateLabel(item.published_at)}</span>
+                {item.road && <span>🛣 {item.road}</span>}
+                <span>🕒 {periodLabel(item.starts_at, item.ends_at, item.published_at)}</span>
                 <span>Source: {item.source_name}</span>
               </div>
+              {item.priority_reason && <div style={{fontSize:11,color:"var(--muted)",marginTop:6}}>Why prioritised: {item.priority_reason}</div>}
               <a className="source-link" href={item.source_item_url} target="_blank" rel="noreferrer">Open original source ↗</a>
             </article>)
           }
@@ -138,15 +172,15 @@ export default function Dashboard({ incidents, dbError, lastRun }: {
 
         <section className="panel">
           <div className="panel-head"><h2>Monitored sources</h2><small>Starting set</small></div>
-          <div className="source-row"><strong>Putevi Srbije</strong><span>State road conditions and restrictions</span><br/><a href="https://www.putevi-srbije.rs/" target="_blank" rel="noreferrer">Open official website ↗</a></div>
-          <div className="source-row"><strong>AMSS</strong><span>Road conditions and traffic reports</span><br/><a href="https://www.amss.org.rs/" target="_blank" rel="noreferrer">Open official website ↗</a></div>
-          <div className="source-row"><strong>RHMZ</strong><span>Weather forecasts and warnings</span><br/><a href="https://www.hidmet.gov.rs/" target="_blank" rel="noreferrer">Open official website ↗</a></div>
+          <div className="source-row"><strong>Putevi Srbije</strong><span>State road conditions and restrictions (collected)</span><br/><a href="https://www.putevi-srbije.rs/" target="_blank" rel="noreferrer">Open official website ↗</a></div>
+          <div className="source-row"><strong>AMSS</strong><span>Road conditions and traffic reports (not collected: blocks automated access)</span><br/><a href="https://www.amss.org.rs/" target="_blank" rel="noreferrer">Open official website ↗</a></div>
+          <div className="source-row"><strong>RHMZ</strong><span>Weather forecasts and warnings (not collected yet)</span><br/><a href="https://www.hidmet.gov.rs/" target="_blank" rel="noreferrer">Open official website ↗</a></div>
           <p style={{fontSize:11,color:"var(--muted)",lineHeight:1.55,marginTop:13}}>Collection coverage depends on what each source exposes to automated access. A source listed here is not proof that every page is successfully ingested.</p>
         </section>
 
         <section className="panel">
           <div className="panel-head"><h2>Collection status</h2></div>
-          <p style={{fontSize:12,color:"var(--muted)",lineHeight:1.7}}>Last run: {lastRun?.finished_at ? dateLabel(lastRun.finished_at) : "No completed run"}<br/>Latest source status: {lastRun?.status || "Not available"}<br/>New records remain marked for review until verified.</p>
+          <p style={{fontSize:12,color:"var(--muted)",lineHeight:1.7}}>Last run: {lastRun?.finished_at ? dateLabel(lastRun.finished_at) : "No completed run"}<br/>Latest source status: {lastRun ? (runStatusLabel[lastRun.status] || lastRun.status) : "Not available"}<br/>New records remain marked for review until verified.</p>
         </section>
       </aside>
     </div>
@@ -154,3 +188,4 @@ export default function Dashboard({ incidents, dbError, lastRun }: {
     <footer className="footer">Serbia Journey Radar · MVP v0.1 · Public-source information only. Verify current restrictions with the original publisher before making operational decisions. No route-specific impacts or delay estimates are asserted.</footer>
   </main>;
 }
+
