@@ -11,10 +11,24 @@ export type SourceItem = {
   sourceName: string;
 };
 
+// AMSS map page removed from defaults: it is JavaScript-rendered and returns 0 items.
+// Add it back (or RHMZ / other sources) via the SOURCE_URLS env var once a text/RSS list page is found.
 const DEFAULT_SOURCES = [
   "https://www.putevi-srbije.rs/index.php/sr/stanje-na-drzavnim-putevima",
-  "https://www.amss.org.rs/na-putu/stanje-na-putu/strana/mapa",
 ];
+
+const USER_AGENT = "SerbiaJourneyRadar/0.1 (public-information monitoring; contact: project owner)";
+
+// Cap on how many item pages are opened per run (keeps the serverless function within its time limit)
+const MAX_DETAIL_FETCHES = 8;
+
+// Words that indicate a real disruption/announcement. Deliberately NO bare "put":
+// it matched "putarina", "putevi", "putni objekti" and turned menu pages into records.
+const KEYWORDS =
+  /(?<!\p{L})(radovi|radova|obustav\w*|izmenjen\w*\s+re[žz]im|zatvor\w*|nezgod\w*|zastoj|protest|manifestacij\w*|upozorenj\w*|sneg|magl\w*|poplav\w*|poledic\w*)/iu;
+
+// Site sections that are never incidents
+const NOISE_URL = /\/(organizacija|galerija|godi(š|s|%C5%A1)nji|brojanje)/i;
 
 export function getSourceUrls(): string[] {
   const configured = (process.env.SOURCE_URLS || "").split(",").map(s => s.trim()).filter(Boolean);
@@ -41,6 +55,20 @@ function parseDate(value: unknown): string | null {
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
+// "23.10.2026. Radovi na ..." -> ISO date at midnight UTC
+function dateFromTitle(title: string): string | null {
+  const m = title.match(/^\s*(\d{1,2})\.(\d{1,2})\.(\d{4})/);
+  if (!m) return null;
+  const d = new Date(Date.UTC(Number(m[3]), Number(m[2]) - 1, Number(m[1])));
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+function isNoiseUrl(link: string) {
+  let decoded = link;
+  try { decoded = decodeURIComponent(link); } catch { /* keep raw */ }
+  return NOISE_URL.test(link) || NOISE_URL.test(decoded);
+}
+
 function itemFromXml(item: any, sourceUrl: string, name: string): SourceItem | null {
   const title = clean(String(item.title?.["#text"] ?? item.title ?? ""));
   const linkValue = item.link?.href ?? item.link ?? item.guid ?? sourceUrl;
@@ -62,11 +90,28 @@ function safeUrl(link: string, base: string) {
   try { return new URL(link, base).toString(); } catch { return base; }
 }
 
+// Opens one announcement page and returns its main text (empty string on any failure)
+async function fetchDetail(url: string): Promise<string> {
+  try {
+    const response = await fetch(url, {
+      headers: { "user-agent": USER_AGENT, accept: "text/html;q=0.9,*/*;q=0.8" },
+      signal: AbortSignal.timeout(10000),
+      cache: "no-store",
+    });
+    if (!response.ok) return "";
+    const $d = cheerio.load(await response.text());
+    $d("script, style, nav, footer, header, noscript, svg").remove();
+    return clean($d("main, article, .content, body").first().text());
+  } catch {
+    return "";
+  }
+}
+
 export async function fetchSourceItems(sourceUrl: string): Promise<SourceItem[]> {
   const name = sourceName(sourceUrl);
   const response = await fetch(sourceUrl, {
     headers: {
-      "user-agent": "SerbiaJourneyRadar/0.1 (public-information monitoring; contact: project owner)",
+      "user-agent": USER_AGENT,
       "accept": "text/html,application/rss+xml,application/atom+xml,application/xml;q=0.9,*/*;q=0.8",
     },
     signal: AbortSignal.timeout(18000),
@@ -78,7 +123,7 @@ export async function fetchSourceItems(sourceUrl: string): Promise<SourceItem[]>
   const looksXml = contentType.includes("xml") || /^\s*<\?xml/i.test(body) || /<rss[\s>]|<feed[\s>]/i.test(body);
 
   if (looksXml && XMLValidator.validate(body) === true) {
-    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_", textNodeName: "#text", isArray: (name) => ["item", "entry"].includes(name) });
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_", textNodeName: "#text", isArray: (n) => ["item", "entry"].includes(n) });
     const parsed = parser.parse(body);
     const entries = parsed?.rss?.channel?.item ?? parsed?.feed?.entry ?? parsed?.channel?.item ?? [];
     const array = Array.isArray(entries) ? entries : [entries];
@@ -89,22 +134,30 @@ export async function fetchSourceItems(sourceUrl: string): Promise<SourceItem[]>
   $("script, style, nav, footer, header, noscript, svg").remove();
   const items: SourceItem[] = [];
   const seen = new Set<string>();
-  const keywords = /radovi|obustav|izmenjen režim|izmenjen rezim|saobraćaj|saobracaj|zastoj|nezgoda|zatvoren|protest|manifestacij|događaj|dogadjaj|upozorenje|sneg|magla|poplav|put|road|traffic|closure|works/i;
 
   $("a[href]").each((_, el) => {
     const title = clean($(el).text());
     const link = safeUrl(String($(el).attr("href") || ""), sourceUrl);
-    if (title.length < 18 || !keywords.test(title) || seen.has(link) || link === sourceUrl) return;
+    if (title.length < 18 || !KEYWORDS.test(title)) return;
+    if (isNoiseUrl(link) || seen.has(link) || link === sourceUrl) return;
     seen.add(link);
     items.push({
       title,
       link,
       description: title,
-      publishedAt: null,
+      publishedAt: dateFromTitle(title),
       sourceUrl,
       sourceName: name,
     });
   });
+
+  // Enrich the first few dated announcements with the full page text
+  // (restrictions, time windows, end date). Failures fall back to the title.
+  const dated = items.filter(i => i.publishedAt).slice(0, MAX_DETAIL_FETCHES);
+  await Promise.all(dated.map(async (item) => {
+    const detail = await fetchDetail(item.link);
+    if (detail) item.description = detail;
+  }));
 
   // Do not convert a generic page visit into an incident. If no relevant entries
   // can be extracted, return zero items and let the collection log show that.
