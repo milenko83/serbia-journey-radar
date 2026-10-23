@@ -63,6 +63,22 @@ function dateFromTitle(title: string): string | null {
   return Number.isNaN(d.getTime()) ? null : d.toISOString();
 }
 
+function slugify(title: string) {
+  return title.toLowerCase().replace(/[^\p{L}\d]+/gu, "-").replace(/^-+|-+$/g, "").slice(0, 80);
+}
+
+// The announcement text of an accordion item is in the element after the title link
+// (or after its parent). Returns "" when nothing usable is found.
+function accordionPanelText($: cheerio.CheerioAPI, el: any): string {
+  const candidates = [$(el).next(), $(el).parent().next()];
+  for (const c of candidates) {
+    if (!c.length || c.is("a.accordionTitle") || c.find("a.accordionTitle").length) continue;
+    const text = clean(c.text());
+    if (text) return text;
+  }
+  return "";
+}
+
 function isNoiseUrl(link: string) {
   let decoded = link;
   try { decoded = decodeURIComponent(link); } catch { /* keep raw */ }
@@ -135,9 +151,31 @@ export async function fetchSourceItems(sourceUrl: string): Promise<SourceItem[]>
   const items: SourceItem[] = [];
   const seen = new Set<string>();
 
+  // 1) Accordion announcements (Putevi Srbije): the title link is javascript:void(0) and the
+  //    announcement text sits in the element right after it. Each one gets its own link
+  //    (page address + #slug) so they are not collapsed into a single item.
+  $("a.accordionTitle").each((_, el) => {
+    const title = clean($(el).text());
+    if (title.length < 10 || seen.has(title)) return;
+    seen.add(title);
+    const alt = clean($(el).find("img").attr("alt") || "");
+    const panel = accordionPanelText($, el);
+    items.push({
+      title,
+      link: `${sourceUrl}#${slugify(title)}`,
+      description: panel ? clean(`${alt ? alt + ". " : ""}${panel}`) : title,
+      publishedAt: dateFromTitle(title),
+      sourceUrl,
+      sourceName: name,
+    });
+  });
+
+  // 2) Ordinary links (only real web addresses, never javascript: or mailto:)
   $("a[href]").each((_, el) => {
+    if ($(el).hasClass("accordionTitle")) return;
     const title = clean($(el).text());
     const link = safeUrl(String($(el).attr("href") || ""), sourceUrl);
+    if (!/^https?:/i.test(link)) return;
     if (title.length < 18 || !KEYWORDS.test(title)) return;
     if (isNoiseUrl(link) || seen.has(link) || link === sourceUrl) return;
     seen.add(link);
@@ -153,7 +191,9 @@ export async function fetchSourceItems(sourceUrl: string): Promise<SourceItem[]>
 
   // Enrich the first few dated announcements with the full page text
   // (restrictions, time windows, end date). Failures fall back to the title.
-  const dated = items.filter(i => i.publishedAt).slice(0, MAX_DETAIL_FETCHES);
+  const dated = items
+    .filter(i => i.publishedAt && i.description === i.title && /^https?:/i.test(i.link) && !i.link.includes("#"))
+    .slice(0, MAX_DETAIL_FETCHES);
   await Promise.all(dated.map(async (item) => {
     const detail = await fetchDetail(item.link);
     if (detail) item.description = detail;
