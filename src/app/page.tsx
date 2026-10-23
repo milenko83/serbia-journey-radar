@@ -13,9 +13,16 @@ export default async function Home() {
   if (!supabase) {
     dbError = "Database is not configured yet. Add the Supabase URL and service-role key to your environment variables, then redeploy.";
   } else {
+    const nowIso = new Date().toISOString();
+
     const { data, error } = await supabase
       .from("incidents")
       .select("*")
+      .eq("status", "active")                          // hide dismissed and expired items
+      .neq("review_status", "not_relevant")            // hide items marked not relevant
+      .or(`ends_at.is.null,ends_at.gte.${nowIso}`)     // hide items whose end date has passed
+      .order("priority_score", { ascending: false })   // most important first
+      .order("starts_at", { ascending: false, nullsFirst: false })
       .order("last_seen_at", { ascending: false })
       .limit(150);
     if (error) dbError = `Could not read incidents: ${error.message}`;
