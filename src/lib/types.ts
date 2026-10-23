@@ -23,4 +23,9 @@ export type Incident = {
   last_seen_at: string;
   last_checked_at: string;
   status: string;
+  // Added by migration_001.sql (optional so older rows never break the page)
+  road?: string | null;
+  section_text?: string | null;
+  priority_score?: number | null;
+  priority_reason?: string | null;
 };
